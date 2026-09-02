@@ -1,0 +1,236 @@
+{
+  "name": "Ecosistema Clinica — Escenario 1: Ingesta, clasificacion y preparacion",
+  "flow": [
+    {
+      "id": 2,
+      "module": "google-email:ActionWatchEmails",
+      "version": 2,
+      "metadata": { "designer": { "name": "1. Trigger — Gmail Watch Emails" } },
+      "parameters": { "account": "__GMAIL_CONNECTION__", "saveAfter": "nowOn" },
+      "mapper": {
+        "folderType": "simple",
+        "folder": "INBOX",
+        "query": "unread",
+        "markSeen": false,
+        "maxResults": 10
+      }
+    },
+    {
+      "id": 3,
+      "module": "builtin:BasicFeeder",
+      "metadata": { "designer": { "name": "2. Validacion — datos minimos presentes" } },
+      "filter": {
+        "name": "Asunto y cuerpo no vacios",
+        "conditions": [[
+          { "a": "{{2.subject}}", "o": "exist" },
+          { "a": "{{2.fullTextBody}}", "o": "exist" }
+        ]]
+      }
+    },
+    {
+      "id": 4,
+      "module": "airtable:ActionSearchRecordsUpsert",
+      "metadata": { "designer": { "name": "3. Upsert — Airtable Pacientes" } },
+      "parameters": { "__IMTCONN__": "__AIRTABLE_CONNECTION__" },
+      "mapper": {
+        "base": "app8ZwR78oGBw0XN2",
+        "table": "Pacientes",
+        "matchField": "Email",
+        "record": {
+          "Email": "{{2.fromEmail}}",
+          "Nombre": "{{2.fromName}}",
+          "Ultima_interaccion": "{{now}}"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "module": "airtable:ActionCreateRecord",
+      "metadata": { "designer": { "name": "4. Crear — Airtable Solicitudes" } },
+      "parameters": { "__IMTCONN__": "__AIRTABLE_CONNECTION__" },
+      "mapper": {
+        "base": "app8ZwR78oGBw0XN2",
+        "table": "Solicitudes",
+        "record": {
+          "Message_ID": "{{2.id}}",
+          "Thread_ID": "{{2.threadId}}",
+          "Asunto": "{{2.subject}}",
+          "Cuerpo": "{{2.fullTextBody}}",
+          "Remitente": "{{2.fromEmail}}",
+          "Paciente": ["{{4.id}}"],
+          "Estado": "Pendiente",
+          "Aprobado": false
+        }
+      }
+    },
+    {
+      "id": 6,
+      "module": "google-ai:CreateSimpleTextPrompt",
+      "metadata": { "designer": { "name": "5. Nodo IA — clasificador de prioridad" } },
+      "mapper": {
+        "model": "gemini-3-flash-preview",
+        "maxTokens": 800,
+        "textPrompt": "INSTRUCCION ESTRICTA: actuas como clasificador de triage para una clinica medica. NO eres un asistente conversacional. Devolve UNICAMENTE un objeto JSON valido, sin texto antes ni despues, con exactamente estas cuatro claves: prioridad, confianza, justificacion, borrador.\n\nprioridad: la cadena ALTA o NORMAL. ALTA si el mensaje describe urgencia medica, dolor agudo, sangrado, cirugia inminente o reclamo grave. NORMAL en cualquier otro caso.\nconfianza: numero entre 0 y 1 con dos decimales.\njustificacion: una oracion citando la parte del correo que motivo la clasificacion.\nborrador: respuesta sugerida al paciente, maximo 80 palabras, tono profesional y empatico, sin prometer diagnosticos ni plazos medicos.\n\nREGLA ANTI-ALUCINACION: no inventes datos clinicos, turnos ni nombres de profesionales que no figuren en el correo.\n\nCorreo a clasificar:\nAsunto: {{2.subject}}\nRemitente: {{2.fromEmail}}\nContenido: {{2.fullTextBody}}"
+      },
+      "onerror": [
+        {
+          "id": 61,
+          "module": "builtin:Retry",
+          "metadata": { "designer": { "name": "Error handler — Retry 3x/15min" } },
+          "mapper": { "attempts": 3, "interval": 15 }
+        },
+        {
+          "id": 62,
+          "module": "airtable:ActionCreateRecord",
+          "metadata": { "designer": { "name": "Error handler — registrar fallo IA" } },
+          "mapper": {
+            "base": "app8ZwR78oGBw0XN2",
+            "table": "Log_Errores",
+            "record": {
+              "Modulo": "Nodo IA",
+              "Tipo_error": "API caida",
+              "Mensaje": "{{error.message}}",
+              "Reintentos": 3,
+              "Resuelto": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "module": "json:ParseJSON",
+      "metadata": { "designer": { "name": "6. Parseo — respuesta JSON de la IA" } },
+      "mapper": { "json": "{{6.result}}" },
+      "onerror": [
+        {
+          "id": 71,
+          "module": "airtable:ActionCreateRecord",
+          "metadata": { "designer": { "name": "Error handler — respuesta invalida" } },
+          "mapper": {
+            "base": "app8ZwR78oGBw0XN2",
+            "table": "Log_Errores",
+            "record": {
+              "Modulo": "Nodo IA",
+              "Tipo_error": "Respuesta invalida",
+              "Mensaje": "La IA no devolvio JSON valido: {{6.result}}",
+              "Resuelto": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "module": "airtable:ActionUpdateRecord",
+      "metadata": { "designer": { "name": "7. Actualizar — resultado de la IA" } },
+      "mapper": {
+        "base": "app8ZwR78oGBw0XN2",
+        "table": "Solicitudes",
+        "id": "{{5.id}}",
+        "record": {
+          "Prioridad_IA": ["{{7.prioridad}}"],
+          "Confianza_IA": "{{7.confianza}}",
+          "Justificacion_IA": "{{7.justificacion}}",
+          "Borrador_Respuesta": "{{7.borrador}}",
+          "Estado": "Procesado por IA"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "module": "builtin:BasicRouter",
+      "metadata": { "designer": { "name": "8. Router — segun requiere aprobacion" } },
+      "routes": [
+        {
+          "filter": {
+            "name": "ALTA — requiere aprobacion humana",
+            "conditions": [[{ "a": "{{7.prioridad}}", "b": "ALTA", "o": "text:equal" }]]
+          },
+          "flow": [
+            {
+              "id": 10,
+              "module": "slack:createMessage",
+              "metadata": { "designer": { "name": "9. HITL — aviso de aprobacion a Slack" } },
+              "parameters": { "__IMTCONN__": "__SLACK_CONNECTION__" },
+              "mapper": {
+                "channelType": "manually",
+                "channel": "#urgencias-clinica",
+                "text": ":rotating_light: *Solicitud de prioridad ALTA — requiere aprobacion*\n*Asunto:* {{2.subject}}\n*Confianza IA:* {{7.confianza}}\n*Motivo:* {{7.justificacion}}\n*Borrador propuesto:* {{7.borrador}}\n\nRevisar y tildar «Aprobado»: https://airtable.com/app8ZwR78oGBw0XN2/{{5.id}}"
+              }
+            },
+            {
+              "id": 11,
+              "module": "airtable:ActionUpdateRecord",
+              "metadata": { "designer": { "name": "10. Marcar en espera de aprobacion" } },
+              "mapper": {
+                "base": "app8ZwR78oGBw0XN2",
+                "table": "Solicitudes",
+                "id": "{{5.id}}",
+                "record": { "Estado": "Esperando aprobacion", "Aprobado": false }
+              }
+            }
+          ]
+        },
+        {
+          "filter": {
+            "name": "NORMAL — respuesta directa sin aprobacion",
+            "conditions": [[{ "a": "{{7.prioridad}}", "b": "NORMAL", "o": "text:equal" }]]
+          },
+          "flow": [
+            {
+              "id": 12,
+              "module": "google-email:ActionSendEmail",
+              "metadata": { "designer": { "name": "11. Gmail — respuesta en el hilo" } },
+              "parameters": { "account": "__GMAIL_CONNECTION__" },
+              "mapper": {
+                "to": ["{{2.fromEmail}}"],
+                "subject": "Re: {{2.subject}}",
+                "threadId": "{{2.threadId}}",
+                "html": "{{7.borrador}}",
+                "contentType": "html"
+              },
+              "onerror": [
+                {
+                  "id": 121,
+                  "module": "builtin:Resume",
+                  "metadata": { "designer": { "name": "Error handler — Resume" } },
+                  "mapper": { "output": "envio fallido, registrado en Log_Errores" }
+                }
+              ]
+            },
+            {
+              "id": 13,
+              "module": "airtable:ActionUpdateRecord",
+              "metadata": { "designer": { "name": "12. Cierre — marcar como enviado" } },
+              "mapper": {
+                "base": "app8ZwR78oGBw0XN2",
+                "table": "Solicitudes",
+                "id": "{{5.id}}",
+                "record": { "Estado": "Enviado", "Canal_enviado": "Gmail" }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "instant": false,
+    "version": 1,
+    "scenario": {
+      "roundtrips": 1,
+      "maxErrors": 3,
+      "autoCommit": true,
+      "sequential": false,
+      "confidential": false,
+      "dataloss": false,
+      "dlq": true
+    },
+    "notas": [
+      "dlq = true habilita el almacenamiento de ejecuciones incompletas, requisito del error handler Retry.",
+      "saveAfter = nowOn evita reprocesar el historico de la casilla y previene el consumo masivo de operaciones.",
+      "Los identificadores de conexion se reemplazaron por marcadores __XXX_CONNECTION__ para no exponer credenciales."
+    ]
+  }
+}

@@ -1,0 +1,120 @@
+{
+  "name": "Ecosistema Clinica — Escenario 2: Distribucion post-aprobacion (HITL)",
+  "flow": [
+    {
+      "id": 1,
+      "module": "airtable:TriggerWatchResponses",
+      "version": 3,
+      "metadata": { "designer": { "name": "1. Trigger — Airtable Watch Records" } },
+      "parameters": { "__IMTCONN__": "__AIRTABLE_CONNECTION__" },
+      "mapper": {
+        "base": "app8ZwR78oGBw0XN2",
+        "table": "Solicitudes",
+        "view": "Listas para enviar",
+        "triggerField": "Fecha_aprobacion",
+        "maxRecords": 10
+      }
+    },
+    {
+      "id": 2,
+      "module": "builtin:BasicFeeder",
+      "metadata": { "designer": { "name": "2. Filtro HITL — barrera de aprobacion" } },
+      "filter": {
+        "name": "Solo contenido validado por humano",
+        "conditions": [[
+          { "a": "{{1.Aprobado}}", "o": "boolean:equal", "b": "true" },
+          { "a": "{{1.Estado}}", "o": "text:equal", "b": "Aprobado por Humano" },
+          { "a": "{{1.Borrador_Respuesta}}", "o": "exist" },
+          { "a": "{{1.Canal_enviado}}", "o": "notexist" }
+        ]]
+      }
+    },
+    {
+      "id": 3,
+      "module": "google-email:ActionSendEmail",
+      "metadata": { "designer": { "name": "3. Gmail — respuesta al paciente en el hilo" } },
+      "parameters": { "account": "__GMAIL_CONNECTION__" },
+      "mapper": {
+        "to": ["{{1.Remitente}}"],
+        "subject": "Re: {{1.Asunto}}",
+        "threadId": "{{1.Thread_ID}}",
+        "html": "{{1.Borrador_Respuesta}}",
+        "contentType": "html"
+      },
+      "onerror": [
+        {
+          "id": 31,
+          "module": "airtable:ActionCreateRecord",
+          "metadata": { "designer": { "name": "Error handler — registrar fallo de envio" } },
+          "mapper": {
+            "base": "app8ZwR78oGBw0XN2",
+            "table": "Log_Errores",
+            "record": {
+              "Modulo": "Gmail Salida",
+              "Tipo_error": "API caida",
+              "Mensaje": "{{error.message}}",
+              "Solicitud": ["{{1.id}}"],
+              "Resuelto": false
+            }
+          }
+        },
+        {
+          "id": 32,
+          "module": "builtin:Resume",
+          "metadata": { "designer": { "name": "Error handler — Resume, no frenar el lote" } },
+          "mapper": { "output": "fallo registrado, continua el resto del lote" }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "module": "slack:createMessage",
+      "metadata": { "designer": { "name": "4. Slack — cierre en el hilo del aviso" } },
+      "parameters": { "__IMTCONN__": "__SLACK_CONNECTION__" },
+      "mapper": {
+        "channelType": "manually",
+        "channel": "#urgencias-clinica",
+        "thread_ttl": "{{1.Thread_ID}}",
+        "text": ":white_check_mark: *Respuesta enviada al paciente*\n*Asunto:* {{1.Asunto}}\n*Aprobado por:* {{1.Revisor}}\n*Tiempo de respuesta:* {{1.Tiempo_respuesta_min}} min — SLA: {{1.Dentro_SLA}}"
+      },
+      "onerror": [
+        {
+          "id": 41,
+          "module": "builtin:Resume",
+          "metadata": { "designer": { "name": "Error handler — Resume" } },
+          "mapper": { "output": "aviso interno fallido, el paciente ya fue contactado" }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "module": "airtable:ActionUpdateRecord",
+      "metadata": { "designer": { "name": "5. Cierre — actualizar estado final" } },
+      "mapper": {
+        "base": "app8ZwR78oGBw0XN2",
+        "table": "Solicitudes",
+        "id": "{{1.id}}",
+        "record": {
+          "Estado": "Enviado",
+          "Canal_enviado": "Gmail"
+        }
+      }
+    }
+  ],
+  "metadata": {
+    "instant": false,
+    "version": 1,
+    "scenario": {
+      "roundtrips": 1,
+      "maxErrors": 3,
+      "autoCommit": true,
+      "sequential": false,
+      "dlq": true
+    },
+    "notas": [
+      "La condicion Canal_enviado notexist evita el doble envio si el escenario se reactiva.",
+      "Aprobado se compara como booleano, no como texto: boolean:equal contra true.",
+      "El escenario no puede ejecutarse sobre registros sin aprobacion humana: el filtro lo impide."
+    ]
+  }
+}
